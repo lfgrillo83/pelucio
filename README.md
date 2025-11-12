@@ -1,4 +1,4 @@
-# 🧠 Pelucio — Sourcemap & JavaScript Analyzer
+# Pelucio — Sourcemap & JavaScript Analyzer
 
 **Pelucio** é uma ferramenta voltada para _security researchers_, _bug hunters_ e _red teamers_ que desejam identificar possíveis vazamentos de informações sensíveis em arquivos **JavaScript** e **Source Maps (.map)** expostos na web.
 
