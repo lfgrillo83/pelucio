@@ -1,412 +1,499 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-PELUCIO v4.2 — JS / MAP Recon Tool (full patterns + refined anti-false-positive + .map discovery)
------------------------------------------------------------------------------------------------
-This version restores patterns and anti-false-positive filters from v4.1 and adds automatic
-.map discovery/processing:
- - when analyzing a remote .js URL, Pelucio will look for an embedded sourceMappingURL
-   or attempt to fetch url + ".map" and will analyze the .map if found.
- - when analyzing a local .js file, Pelucio will look for a same-directory .map (filename.js.map
-   or filename.map) and for embedded sourceMappingURL references and analyze the .map files.
-All other detection/filtering behavior is preserved from v4.1.
-"""
+# pelucio.py v1.4.0
+# Analisa URLs de .js e .map (inline e remotos), detecta possíveis vazamentos,
+# segue referências para outros .js (cascata limitada), e gera:
+#   - pelucio_findings.json
+#   - pelucio_urls.txt
+#   - pelucio_wordlist.txt
+#   - pelucio_findings.csv (ordenado por criticidade)
 from __future__ import annotations
-import argparse, concurrent.futures, csv, json, math, os, random, re, sys, requests, time
-from collections import Counter
+
+import argparse
+import base64
+import concurrent.futures
+import csv
+import json
+import os
+import re
+import sys
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
-from tqdm import tqdm
 
-VERSION = "4.2"
-MAX_MAP_BYTES = 30 * 1024 * 1024
-DEFAULT_THREADS = 20
-DEFAULT_TIMEOUT = 10
+import requests
 
-UA_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
-    "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36",
+VERSION = "1.4.0"
+DEFAULT_TIMEOUT = 15
+UA = f"pelucio/{VERSION}"
+
+# =========================
+# Banner
+# =========================
+def print_banner() -> None:
+    print("\n" + "=" * 72)
+    print(f"  🧠  Pelucio v{VERSION}")
+    print("  Sourcemap & JavaScript Analyzer — detecção de leaks, URLs e paths")
+    print("  Bichinho tranquera roubador de itens preciosos")
+    print("=" * 72 + "\n")
+
+# =========================
+# Config
+# =========================
+FALSE_POS = [
+    "fonts.gstatic.com",
+    "fonts.googleapis.com",
+    "roboto",
+    "com/s/roboto",
+    "/wp-includes/",
+    "google-analytics.com/analytics.js",
 ]
 
-CDN_HOST_RE = re.compile(r"(fonts\.gstatic|googleapis|cloudflare|jsdelivr|unpkg|recaptcha|bootstrapcdn|cdn\.js)", re.I)
-ASSET_EXT_RE = re.compile(r"\.(?:png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|eot|mp4|webm|css|map)\b", re.I)
-SOURCEMAP_RE = re.compile(r"(?:\/\/[#@]\s*sourceMappingURL=|/\*#\s*sourceMappingURL=)\s*([^\s\*'\";]+)", re.I)
-
-# --- Patterns ---
+# --- PATTERNS (sem generic_api_key) ---
 PATTERNS = {
     "private_key": re.compile(r"-----BEGIN (?:RSA|DSA|EC|PRIVATE) KEY-----"),
-    "aws_secret_key": re.compile(r"(?i)aws_secret_access_key[^A-Za-z0-9]{0,10}([A-Za-z0-9/+=]{40})"),
+    "aws_secret_key": re.compile(r"(?i)aws_secret_access_key.*[:=]\s*[A-Za-z0-9/+=]{40,}"),
     "aws_access_key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    "slack_webhook": re.compile(r"https?://hooks\.slack\.com/services/[A-Za-z0-9/_-]{8,}"),
-    "jwt": re.compile(r"\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
-    "bearer_token": re.compile(r"(?i)bearer\s+([A-Za-z0-9\-\._]{20,})"),
-    "query_token": re.compile(r"(?:[?&](?:token|access_token|api_key|auth|secret)=)([^&\s]{6,})", re.I),
-    "generic_api_key": re.compile(r"\b[A-Za-z0-9-_]{32,}\b"),
-    "long_base64": re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
-    "email": re.compile(r"[A-Za-z0-9.\-_+]+@[A-Za-z0-9\-_]+\.[A-Za-z0-9.\-_]+"),
-    "url": re.compile(r"https?://[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:/[^\s'\"<>()]*)?", re.I),
-    "password_like": re.compile(r'(?i)(?:password|passwd|pwd|senha)\s*[:=]\s*["\']([^"\']{4,})["\']'),
+    "slack_webhook": re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]{8,}"),
+    "jwt": re.compile(r"\beyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\b"),
+    "bearer_token": re.compile(r"(?i)bearer\s+([A-Za-z0-9\-\._~\+/=]{20,})"),
+    "query_token": re.compile(r"(?i)(?:token|api_key|access_token|auth|secret)=([^ \s&\"';]+)"),
+    "long_base64": re.compile(r"(?P<quote>['\"])?(?P<b64>(?:[A-Za-z0-9+/]{40,}={0,2}))(?:(?P=quote))"),
+    "email": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+    "url": re.compile(r"https?://[^\s\"'<>]+"),
+    "password_like": re.compile(r"(?i)(?:\bsenha\b|\bpassw?d\b|\bpasswd\b|\bpwd\b)\s*[:=]\s*[\"']([^\"']{4,})[\"']"),
+    "script_src": re.compile(r"<script[^>]+src=[\"'](?P<src>[^\"']+\.js[^\"']*)[\"']", re.I),
 }
 
-SCORES = {
-    "private_key": 100, "aws_secret_key": 80, "aws_access_key": 60,
-    "slack_webhook": 60, "password_like": 90, "jwt": 50,
-    "bearer_token": 45, "query_token": 40, "generic_api_key": 15,
-    "long_base64": 10, "email": 5, "url": 3,
+HIGH_TYPES = {
+    "private_key", "aws_secret_key", "aws_access_key", "slack_webhook",
+    "jwt", "bearer_token", "query_token", "password_like",
 }
-HIGH_CONF_TYPES = {"private_key","aws_secret_key","aws_access_key","slack_webhook","password_like","jwt","bearer_token","query_token"}
+LOW_TYPES = {"long_base64", "email", "url"}
 
-def entropy(s):
-    if not s: return 0.0
-    c, l = Counter(s), len(s)
-    return -sum((v/l)*math.log2(v/l) for v in c.values())
+SOURCE_MAP_REGEX = re.compile(r"//#\s*sourceMappingURL\s*=\s*(.+)|//@\s*sourceMappingURL\s*=\s*(.+)")
+INLINE_SOURCEMAP_REGEX = re.compile(r"(?:sourceMappingURL\s*=\s*data:application/json;base64,)([A-Za-z0-9+/=]+)")
 
-def has_mixed_charsets(s, min_classes=2):
-    c = 0
-    if re.search(r"[a-z]", s): c += 1
-    if re.search(r"[A-Z]", s): c += 1
-    if re.search(r"[0-9]", s): c += 1
-    if re.search(r"[^A-Za-z0-9]", s): c += 1
-    return c >= min_classes
+# =========================
+# Helpers
+# =========================
+def is_false_positive(s: str) -> bool:
+    sl = s.lower()
+    return any(fp in sl for fp in FALSE_POS)
 
-def print_banner():
-    CYAN, YELLOW, RESET = "\033[96m", "\033[93m", "\033[0m"
-    print(f"{CYAN}PELUCIO — JS / MAP Recon Tool{RESET}")
-    print(f"{YELLOW}version {VERSION}{RESET}\nAuthorized security testing only\n")
+def classify(kind: str, value: str, decoded_preview: Optional[str] = None) -> str:
+    if kind in HIGH_TYPES:
+        return "high"
+    if kind in LOW_TYPES:
+        if decoded_preview and any(k in decoded_preview.lower() for k in ("api_key","secret","token","password","private","aws")):
+            return "high"
+        return "low"
+    return "low"
 
-class PelucioScanner:
-    def __init__(self, args):
-        self.args = args
-        self.outdir = Path(args.output)
-        self.outdir.mkdir(parents=True, exist_ok=True)
-        self.session = requests.Session()
-        if args.proxy:
-            self.session.proxies.update({"http": args.proxy, "https": args.proxy})
-        self.verify = not args.insecure
-        self.timeout = args.timeout
-        self.findings, self.discovered_urls, self.ffuf_paths, self.processed = [], set(), set(), set()
+def try_gunzip(b: bytes) -> bytes:
+    try:
+        import gzip
+        return gzip.decompress(b)
+    except Exception:
+        return b
 
-    def _headers(self):
-        return {"User-Agent": self.args.user_agent or random.choice(UA_POOL)}
+def safe_fetch(url: str, timeout: float = DEFAULT_TIMEOUT) -> Tuple[Optional[bytes], Optional[int], Optional[str]]:
+    try:
+        r = requests.get(url, headers={"User-Agent": UA, "Accept-Encoding": "gzip, deflate"}, timeout=timeout, allow_redirects=True)
+        return r.content, r.status_code, None
+    except requests.RequestException as e:
+        return None, None, str(e)
 
-    def scan(self, sources):
-        start = time.time()
-        with tqdm(total=len(sources), desc="Analyzing", unit="src") as bar:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.args.threads) as ex:
-                futures = [ex.submit(self._process_source, s) for s in sources]
-                for _ in concurrent.futures.as_completed(futures):
-                    bar.update(1)
-        print(f"\n[+] Scan finished in {time.time() - start:.1f}s")
+def base64_try_decode(s: str) -> Optional[bytes]:
+    s = s.strip()
+    if not re.fullmatch(r"[A-Za-z0-9+/=]+", s): return None
+    s += "=" * ((4 - len(s) % 4) % 4)
+    try: return base64.b64decode(s, validate=False)
+    except Exception: return None
 
-    def _process_source(self, src):
-        key = f"{src['type']}::{src['value']}"
-        if key in self.processed:
-            return
-        self.processed.add(key)
-        if src["type"] == "url":
-            self._process_url(src["value"])
-        else:
-            self._process_file(src["value"])
+def jwt_decode_part(part: str) -> Optional[str]:
+    p = part.replace("-", "+").replace("_", "/")
+    p += "=" * ((4 - len(p) % 4) % 4)
+    try: return base64.b64decode(p).decode("utf-8", errors="ignore")
+    except Exception: return None
 
-    def _process_url(self, url):
-        """Process a remote URL. If it's JS and contains/points to a .map, fetch & analyze it too."""
-        r = {"source": url, "type": "url", "score": 0, "matches": [], "high_conf": 0, "static_filtered": 0}
-        try:
-            resp = self.session.get(url, headers=self._headers(), timeout=self.timeout, verify=self.verify)
-            text = resp.text
-            score, matches, filt, high = self._detect(text)
-            r.update({"score": score, "matches": matches, "static_filtered": filt, "high_conf": high})
-            # extract discovered urls & paths
-            if matches:
-                self._extract_links(text, url)
-                self._extract_paths(text, url)
+def candidate_sourcemap_urls(js_url: str) -> List[str]:
+    parsed = urlparse(js_url)
+    base_path = parsed.path or ""
+    candidates: List[str] = []
+    if base_path.endswith(".js"):
+        basename = os.path.basename(base_path)
+        name_noext = os.path.splitext(basename)[0]
+        candidates.append(urljoin(js_url, basename + ".map"))
+        candidates.append(urljoin(js_url, base_path[:-3] + ".map"))
+        candidates.append(urljoin(js_url, os.path.dirname(base_path) + "/" + name_noext + ".map"))
+    else:
+        candidates.append(urljoin(js_url, base_path + ".map"))
+    seen, out = set(), []
+    for u in candidates:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
-            # Attempt to find sourceMappingURL in JS content
-            # Only try if the content looks like JS (heuristic: extension .js or 'function'/'var' in content)
-            # but we'll search for sourceMappingURL regardless.
-            m = SOURCEMAP_RE.search(text)
-            if m:
-                smref = m.group(1).strip()
-                try:
-                    sm_url = urljoin(url, smref)
-                    # avoid reprocessing same
-                    if f"map::{sm_url}" not in self.processed:
-                        self.processed.add(f"map::{sm_url}")
-                        self._fetch_and_process_map(sm_url, origin=url)
-                except Exception:
-                    pass
-            else:
-                # fallback: try url + ".map" and url + ".js.map"
-                try_candidates = []
-                if url.lower().endswith(".js"):
-                    try_candidates.append(url + ".map")
-                    try_candidates.append(url[:-3] + ".map")
+def extract_paths_from_url(url: str) -> Set[str]:
+    try:
+        p = urlparse(url).path
+        if not p or p == "/": return set()
+        parts = p.strip("/").split("/")
+        acc, cur = set(), ""
+        for seg in parts:
+            cur += "/" + seg
+            acc.add(cur)
+        acc.add(p)
+        return acc
+    except Exception:
+        return set()
+
+def resolve_ref(base_url: str, ref: str) -> Optional[str]:
+    ref = ref.strip()
+    if ref.startswith("data:"): return None
+    if re.match(r"^https?://", ref, re.I): return ref
+    try:
+        joined = urljoin(base_url, ref)
+        if re.match(r"^https?://", joined, re.I): return joined
+    except Exception:
+        pass
+    return None
+
+# =========================
+# Análise de texto
+# =========================
+def analyze_text(blob_text: str) -> Tuple[List[Dict[str,Any]], List[str], List[str]]:
+    findings: List[Dict[str,Any]] = []
+    urls_found: List[str] = []
+    js_refs: List[str] = []
+
+    for key, regex in PATTERNS.items():
+        for m in regex.finditer(blob_text):
+            try:
+                if key in ("bearer_token","query_token","password_like"):
+                    val = m.group(1) if m.groups() else m.group(0)
+                elif key == "long_base64":
+                    val = m.group("b64") if "b64" in regex.groupindex else m.group(0)
+                elif key == "script_src":
+                    val = m.group("src")
                 else:
-                    try_candidates.append(url + ".map")
-                for cand in try_candidates:
-                    if f"map::{cand}" in self.processed:
-                        continue
-                    try:
-                        head = self.session.head(cand, headers=self._headers(), timeout=self.timeout, verify=self.verify)
-                        if head.status_code == 200 and int(head.headers.get("Content-Length", "0")) < MAX_MAP_BYTES:
-                            self.processed.add(f"map::{cand}")
-                            self._fetch_and_process_map(cand, origin=url)
-                            break
-                    except Exception:
-                        # ignore and continue
-                        continue
+                    val = m.group(0)
+            except Exception:
+                val = m.group(0)
+            val = (val or "").strip()
+            if not val:
+                continue
+            if key == "url" and is_false_positive(val):
+                continue
 
-        except Exception as e:
-            r["error"] = str(e)
-        if r["matches"]:
-            self.findings.append(r)
+            decoded_preview = None
+            jwt_parts = None
 
-    def _fetch_and_process_map(self, sm_url, origin=None):
-        """Fetch a .map file and run detection on its content."""
+            if key == "long_base64":
+                dec = base64_try_decode(val)
+                if dec:
+                    try: decoded_preview = dec.decode("utf-8", errors="ignore")
+                    except Exception: pass
+
+            if key == "jwt":
+                parts = val.split(".")
+                if len(parts) >= 2:
+                    header = jwt_decode_part(parts[0])
+                    payload = jwt_decode_part(parts[1])
+                    jwt_parts = {"header": header, "payload": payload}
+                    decoded_preview = payload or header or decoded_preview
+
+            if key == "url":
+                urls_found.append(val)
+            if key == "script_src":
+                js_refs.append(val)
+
+            findings.append({
+                "type": key,
+                "value": val,
+                "decoded_preview": decoded_preview,
+                "jwt_parts": jwt_parts,
+                "sensitivity": classify(key, val, decoded_preview),
+            })
+
+    for m in re.finditer(r"https?://[^\s'\"<>]+\.js[^\s'\"<>]*", blob_text):
+        u = m.group(0)
+        if u not in urls_found:
+            urls_found.append(u)
+
+    return findings, sorted(set(urls_found)), sorted(set(js_refs))
+
+def parse_sourcemap_bytes(blob_bytes: bytes) -> Tuple[Optional[Dict[str,Any]], str]:
+    try: txt = try_gunzip(blob_bytes).decode("utf-8", errors="ignore")
+    except Exception: txt = str(blob_bytes[:2000])
+    try:
+        obj = json.loads(txt)
+        if isinstance(obj, dict):
+            sc = obj.get("sourcesContent")
+            if isinstance(sc, list) and sc:
+                hay = "\n\n".join([s for s in sc if isinstance(s, str)])
+                return obj, hay
+            return obj, txt
+        return None, txt
+    except Exception:
+        return None, txt
+
+# =========================
+# Processamento de um JS
+# =========================
+def process_js_entry(js_url: str, timeout: float) -> Dict[str,Any]:
+    result = {
+        "js_url": js_url,
+        "js_status": None,
+        "sourcemap_found": None,
+        "sourcemap_status": None,
+        "has_sourcesContent": False,
+        "findings": [],
+        "discovered_urls": [],
+        "referenced_js": [],
+    }
+    js_bytes, js_status, _ = safe_fetch(js_url, timeout=timeout)
+    result["js_status"] = js_status
+    if not js_bytes:
+        return result
+
+    try:
+        js_text = try_gunzip(js_bytes).decode("utf-8", errors="replace")
+    except Exception:
+        js_text = js_bytes.decode("latin1", errors="replace")
+
+    inline = INLINE_SOURCEMAP_REGEX.search(js_text)
+    if inline:
         try:
-            resp = self.session.get(sm_url, headers=self._headers(), timeout=self.timeout, verify=self.verify, stream=True)
-            # check size
-            content_length = int(resp.headers.get("Content-Length", "0")) if resp.headers.get("Content-Length") else None
-            if content_length and content_length > MAX_MAP_BYTES:
-                return
-            # read, but cap
-            txt = resp.content[:MAX_MAP_BYTES].decode("utf-8", "ignore")
-            score, matches, filt, high = self._detect(txt)
-            if matches:
-                entry = {"source": sm_url, "type": "map_url", "score": score, "matches": matches, "high_conf": high, "static_filtered": filt}
-                self.findings.append(entry)
-                # also extract links/paths from map content if any
-                self._extract_links(txt, sm_url)
-                self._extract_paths(txt, sm_url)
+            dec = base64.b64decode(inline.group(1))
+            obj, hay = parse_sourcemap_bytes(dec)
+            result["sourcemap_found"] = {"type": "inline"}
+            if obj and obj.get("sourcesContent"): result["has_sourcesContent"] = True
+            f, u, refs = analyze_text(hay)
+            result["findings"].extend(f)
+            result["discovered_urls"].extend(u)
+            result["referenced_js"].extend(refs)
         except Exception:
             pass
 
-    def _process_file(self, p):
-        """Process a local file. If it's JS, try to find local .map files (inline sourceMappingURL or sibling .map files)."""
-        p = Path(p)
-        r = {"source": str(p), "type": "file", "score": 0, "matches": [], "high_conf": 0, "static_filtered": 0}
-        try:
-            txt = p.read_text("utf-8", "ignore")
-            score, matches, filt, high = self._detect(txt)
-            r.update({"score": score, "matches": matches, "static_filtered": filt, "high_conf": high})
-            if matches:
-                self._extract_links(txt, str(p))
-                self._extract_paths(txt, None)
+    sm_comments = SOURCE_MAP_REGEX.findall(js_text)
+    sm_targets = [m[0] or m[1] for m in sm_comments if (m[0] or m[1])]
+    candidates: List[str] = []
+    for tgt in sm_targets:
+        tgt = tgt.strip()
+        if not tgt.startswith("data:"):
+            candidates.append(urljoin(js_url, tgt))
+    candidates.extend(candidate_sourcemap_urls(js_url))
 
-            # If file is .js, try to detect sourceMappingURL and sibling .map files
-            if p.suffix.lower() == ".js" or p.name.lower().endswith(".js"):
-                m = SOURCEMAP_RE.search(txt)
-                if m:
-                    smref = m.group(1).strip()
-                    try:
-                        # if smref is absolute URL -> skip (we only handle local files here)
-                        if smref.startswith("http://") or smref.startswith("https://"):
-                            smurl = smref
-                            # remote map: fetch & process (but avoid duplicates)
-                            if f"map::{smurl}" not in self.processed:
-                                self.processed.add(f"map::{smurl}")
-                                self._fetch_and_process_map(smurl, origin=str(p))
-                        else:
-                            # resolve relative to file directory
-                            smpath = (p.parent / smref).resolve()
-                            if smpath.exists() and smpath.is_file():
-                                key = f"map::{str(smpath)}"
-                                if key not in self.processed:
-                                    self.processed.add(key)
-                                    txtmap = smpath.read_text("utf-8", "ignore")
-                                    score_m, matches_m, filt_m, high_m = self._detect(txtmap)
-                                    if matches_m:
-                                        entry = {"source": str(smpath), "type": "map_file", "score": score_m, "matches": matches_m, "high_conf": high_m, "static_filtered": filt_m}
-                                        self.findings.append(entry)
-                    except Exception:
-                        pass
+    seen, uniq = set(), []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
 
-                # fallback: check for sibling files: filename.js.map and filename.map
-                base_js = p
-                candidates = [p.with_name(p.name + ".map"), p.with_suffix(p.suffix + ".map"), p.with_suffix(".map")]
-                for cand in candidates:
-                    try:
-                        if cand.exists() and cand.is_file():
-                            key = f"map::{str(cand)}"
-                            if key in self.processed:
-                                continue
-                            self.processed.add(key)
-                            txtmap = cand.read_text("utf-8", "ignore")
-                            score_m, matches_m, filt_m, high_m = self._detect(txtmap)
-                            if matches_m:
-                                entry = {"source": str(cand), "type": "map_file", "score": score_m, "matches": matches_m, "high_conf": high_m, "static_filtered": filt_m}
-                                self.findings.append(entry)
-                    except Exception:
-                        continue
+    for c in uniq:
+        mb, st, _ = safe_fetch(c, timeout=timeout)
+        if not mb:
+            continue
+        obj, hay = parse_sourcemap_bytes(mb)
+        result["sourcemap_found"] = {"type": "remote", "url": c}
+        result["sourcemap_status"] = st
+        if obj and obj.get("sourcesContent"): result["has_sourcesContent"] = True
+        f, u, refs = analyze_text(hay)
+        result["findings"].extend(f)
+        result["discovered_urls"].extend(u)
+        result["referenced_js"].extend(refs)
+        break
 
-        except Exception as e:
-            r["error"] = str(e)
-        if r["matches"]:
-            self.findings.append(r)
+    f_js, u_js, refs_js = analyze_text(js_text)
+    result["findings"].extend(f_js)
+    result["discovered_urls"].extend(u_js)
+    result["referenced_js"].extend(refs_js)
 
-    # === Detection Core (identical filtering logic as v4.1 with JWT/generic_api_key improvements) ===
-    def _detect(self, text):
-        total, matches, filt, high, seen = 0, [], 0, 0, {}
-        for name, regex in PATTERNS.items():
-            for m in regex.finditer(text):
-                raw = m.group(0)
-                start, end = m.start(), m.end()
-                context = text[max(0, start-200):min(len(text), end+200)]
+    resolved_refs: List[str] = []
+    for ref in sorted(set(result["referenced_js"])):
+        r = resolve_ref(js_url, ref)
+        if r: resolved_refs.append(r)
+    for u in result["discovered_urls"]:
+        if u.lower().endswith(".js"):
+            resolved_refs.append(u)
+    result["referenced_js"] = sorted(set(resolved_refs))
 
-                if re.search(r"fonts\.gstatic|roboto", context, re.I):
-                    filt += 1; continue
-                if CDN_HOST_RE.search(raw) or ASSET_EXT_RE.search(raw):
-                    filt += 1; continue
+    uniqf: Dict[Tuple[str,str], Dict[str,Any]] = {}
+    for f in result["findings"]:
+        k = (f.get("type"), f.get("value"))
+        if k not in uniqf:
+            uniqf[k] = f
+    result["findings"] = list(uniqf.values())
+    result["discovered_urls"] = sorted(set(result["discovered_urls"]))
+    return result
 
-                if re.match(r"^[A-Za-z][A-Za-z0-9_]*$", raw):
-                    if len(re.findall(r"[A-Z]", raw)) >= 3 or re.search(r"(Element|Node|Client|Width|Height|create|Scroll|Doc|Ref|Error|Count|Request|Session|Token|Validation|overlay|parentNode|removeChild)", raw, re.I):
-                        filt += 1; continue
+# =========================
+# Runner
+# =========================
+def run_all(js_list: List[str], threads: int, timeout: float, outdir: str, max_depth: int = 3) -> Dict[str,Any]:
+    outp = Path(outdir); outp.mkdir(parents=True, exist_ok=True)
+    findings_path = outp / "pelucio_findings.json"
+    urls_path = outp / "pelucio_urls.txt"
+    wordlist_path = outp / "pelucio_wordlist.txt"
+    csv_path = outp / "pelucio_findings.csv"
 
-                # stricter JWT validation to avoid method names being tagged
-                if name == "jwt":
-                    parts = raw.split(".")
-                    if len(parts) != 3:
-                        filt += 1; continue
-                    h, p, s = parts
-                    if any(len(x) < 16 for x in (h, p)) or not all(re.match(r"^[A-Za-z0-9_-]+$", x) for x in parts):
-                        filt += 1; continue
-                    if not h.startswith(("eyJ", "e30")):
-                        filt += 1; continue
-                    if entropy(p) < 3.5 or re.match(r"^[A-Za-z]+$", p):
-                        filt += 1; continue
+    results: List[Dict[str,Any]] = []
+    discovered_urls_global: Set[str] = set()
+    wordlist_paths: Set[str] = set()
 
-                if name == "long_base64":
-                    if re.match(r"^[A-Z][a-zA-Z0-9_]+$", raw):
-                        filt += 1; continue
-                    if entropy(raw) < 3.8 or not re.match(r"^[A-Za-z0-9+/=]+$", raw):
-                        filt += 1; continue
-                    if "/s/roboto" in context or "fonts.gstatic.com" in context:
-                        filt += 1; continue
+    seen_urls: Set[str] = set()
+    lock = threading.Lock()
+    scheduled = 0
+    processed = 0
 
-                if name == "generic_api_key":
-                    if entropy(raw) < 4.0 or not has_mixed_charsets(raw, 3):
-                        filt += 1; continue
-                    if re.match(r"^[A-Z]?[a-z]+(?:[A-Z][a-z]+)+$", raw):
-                        filt += 1; continue
-                    if raw.count("_") >= 4:
-                        filt += 1; continue
-                    if re.search(r"(color|text|font|style|heading|body|regular|medium|bold|button|hero_)", raw, re.I):
-                        filt += 1; continue
-                    if re.search(r"(^--|spoticon|illustration|biometricId|icon|svg|theme|palette|mask|gradient|shadow|fill|stroke|border|radius)", raw, re.I):
-                        filt += 1; continue
-                    if not re.search(r"\d", raw):
-                        filt += 1; continue
-                    if re.search(r"(onLight|onDark|feedback|celebration|overlay|element|parent|child)", raw, re.I):
-                        filt += 1; continue
+    def submit_url(ex, u: str, depth: int, fmap: Dict):
+        nonlocal scheduled
+        with lock:
+            if u in seen_urls: return
+            seen_urls.add(u)
+            scheduled += 1
+        fut = ex.submit(process_js_entry, u, timeout)
+        fmap[fut] = (u, depth)
 
-                if raw in seen:
-                    continue
-                seen[raw] = True
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+        futures_map: Dict[concurrent.futures.Future, Tuple[str,int]] = {}
+        for u in js_list:
+            su = u.strip()
+            if su:
+                submit_url(ex, su, 0, futures_map)
 
-                matches.append({"type": name, "match": raw})
-                total += SCORES.get(name, 5)
-                if name in HIGH_CONF_TYPES:
-                    high += 1
+        while futures_map:
+            done, _ = concurrent.futures.wait(list(futures_map.keys()), return_when=concurrent.futures.FIRST_COMPLETED)
+            for fut in done:
+                url, depth = futures_map.pop(fut)
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = {"js_url": url, "findings": [], "discovered_urls": [], "referenced_js": [], "error": str(e)}
+                results.append(res)
 
-                if name == "url" and not any(u in raw for u in ("googleapis","gstatic","fonts.gstatic")):
-                    self.discovered_urls.add(raw)
-                    try:
-                        path = urlparse(raw).path
-                        if path and path.count("/")>0 and len(path)>1:
-                            self.ffuf_paths.add(path)
-                    except:
-                        pass
-        return total, matches, filt, high
+                for u in res.get("discovered_urls", []):
+                    discovered_urls_global.add(u)
+                    for p in extract_paths_from_url(u):
+                        wordlist_paths.add(p)
+                for f in res.get("findings", []):
+                    v = f.get("value")
+                    if isinstance(v, str) and v.startswith("http"):
+                        for p in extract_paths_from_url(v):
+                            wordlist_paths.add(p)
 
-    def _extract_links(self, text, base):
-        for m in re.finditer(r'href=["\']([^"\']+)["\']', text, re.I):
-            href = m.group(1).strip()
-            if not href or href.startswith("#") or href.lower().startswith("javascript:"):
-                continue
-            try:
-                full = urljoin(base, href) if base else href
-                if not ASSET_EXT_RE.search(full):
-                    self.discovered_urls.add(full)
-            except:
-                continue
+                if depth < max_depth:
+                    for ref in res.get("referenced_js", []):
+                        if re.match(r"^https?://", ref, re.I):
+                            submit_url(ex, ref, depth + 1, futures_map)
 
-    def _extract_paths(self, text, base=None):
-        for m in re.finditer(r'(?:src|href)=["\']([^"\']+)["\']', text, re.I):
-            val = m.group(1).strip()
-            try:
-                full = urljoin(base, val) if base else val
-                if ASSET_EXT_RE.search(full):
-                    continue
-                p = urlparse(full).path if full.startswith("http") else full
-                if p:
-                    self.ffuf_paths.add(p)
-            except:
-                continue
+                with lock:
+                    processed += 1
+                    pct = (processed / scheduled) * 100 if scheduled else 100.0
+                sys.stdout.write(f"\r[+] Andamento: {processed}/{scheduled} ({pct:.1f}%)   ")
+                sys.stdout.flush()
 
-    def write_outputs(self):
-        if not self.findings:
-            print("[-] No findings."); return
-        (self.outdir / "findings.json").write_text(json.dumps(self.findings, indent=2))
-        with open(self.outdir / "findings.csv","w",newline="",encoding="utf-8") as f:
-            w = csv.writer(f); w.writerow(["Source","Type","Match"])
-            for r in self.findings:
-                for m in r["matches"]:
-                    w.writerow([r["source"], m["type"], m["match"]])
-        if self.discovered_urls:
-            (self.outdir / "discovered_urls.txt").write_text("\n".join(sorted(self.discovered_urls)))
-        if self.ffuf_paths:
-            (self.outdir / "ffuf_paths.txt").write_text("\n".join(sorted(self.ffuf_paths)))
-        print(f"[+] Results written to {self.outdir}/")
+    print("\n[+] Análise concluída.\n")
 
-def gather_sources(a):
-    src = []
-    if a.input:
-        with open(a.input, "r", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("http"):
-                    src.append({"type": "url", "value": line})
-                elif os.path.exists(line):
-                    src.append({"type": "file", "value": line})
-                else:
-                    src.append({"type": "url", "value": line})
-    if a.dir:
-        for root, _, files in os.walk(a.dir):
-            for f in files:
-                if f.lower().endswith((".js", ".map")):
-                    src.append({"type": "file", "value": os.path.join(root, f)})
-    # dedupe
-    seen = set(); out = []
-    for s in src:
-        k = (s["type"], s["value"])
-        if k not in seen:
-            seen.add(k); out.append(s)
-    return out
+    meta = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "input_count": len(js_list),
+        "version": VERSION,
+        "cascading_max_depth": max_depth,
+        "total_processed": len(results),
+    }
+    with findings_path.open("w", encoding="utf-8") as fh:
+        json.dump({"meta": meta, "results": results}, fh, ensure_ascii=False, indent=2)
 
-def main():
-    p = argparse.ArgumentParser(description="PELUCIO v4.2")
-    p.add_argument("--input","-i",help="File with list of URLs or paths (one per line)")
-    p.add_argument("--dir","-d",help="Directory to recursively scan for .js and .map files")
-    p.add_argument("--output","-o",default="pelucio_out_v42")
-    p.add_argument("--proxy",help="Proxy (http://host:port)")
-    p.add_argument("--insecure",action="store_true",help="Disable SSL verification")
-    p.add_argument("--threads",type=int,default=DEFAULT_THREADS)
-    p.add_argument("--timeout",type=int,default=DEFAULT_TIMEOUT)
-    p.add_argument("--user-agent",help="Custom user-agent (overrides rotation)")
-    a = p.parse_args()
+    with urls_path.open("w", encoding="utf-8") as fh:
+        for u in sorted(discovered_urls_global):
+            fh.write(u + "\n")
+
+    cleaned = {p for p in wordlist_paths if p and p != "/"}
+    with wordlist_path.open("w", encoding="utf-8") as fh:
+        for p in sorted(cleaned):
+            fh.write(p + "\n")
+
+    def risk_counts(r: Dict[str,Any]) -> Tuple[int,int,int]:
+        hi = sum(1 for f in r.get("findings", []) if f.get("sensitivity") == "high")
+        md = sum(1 for f in r.get("findings", []) if f.get("sensitivity") == "medium")
+        lo = sum(1 for f in r.get("findings", []) if f.get("sensitivity") == "low")
+        return hi, md, lo
+
+    rows = []
+    for r in results:
+        hi, md, lo = risk_counts(r)
+        if hi > 0: risk = "HIGH"
+        elif md > 0: risk = "MEDIUM"
+        elif lo > 0: risk = "LOW"
+        else: risk = "NONE"
+        sample = " | ".join(f"{f.get('type')}:{(f.get('value') or '')[:80]}" for f in (r.get("findings") or [])[:6])
+        rows.append({
+            "identifier": r.get("js_url"),
+            "risk": risk, "hi": hi, "md": md, "lo": lo,
+            "has_sourcesContent": r.get("has_sourcesContent", False),
+            "sample_hits": sample
+        })
+
+    def sort_key(row):
+        bucket = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(row["risk"], 3)
+        return (bucket, -row["hi"], -row["md"], -row["lo"], row["identifier"])
+
+    rows_sorted = sorted(rows, key=sort_key)
+    with csv_path.open("w", encoding="utf-8", newline="") as cf:
+        w = csv.writer(cf)
+        w.writerow(["identifier","risk","high_findings","medium_findings","low_findings","has_sourcesContent","sample_hits"])
+        for row in rows_sorted:
+            w.writerow([row["identifier"], row["risk"], row["hi"], row["md"], row["lo"], row["has_sourcesContent"], row["sample_hits"]])
+
+    return {
+        "findings_json": str(findings_path),
+        "urls_txt": str(urls_path),
+        "wordlist": str(wordlist_path),
+        "csv": str(csv_path),
+    }
+
+# =========================
+# CLI
+# =========================
+def read_input_lines(src: str) -> List[str]:
+    if src == "-":
+        return [l.strip() for l in sys.stdin.read().splitlines() if l.strip()]
+    p = Path(src)
+    if not p.exists():
+        raise FileNotFoundError(src)
+    return [l.strip() for l in p.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip() and not l.strip().startswith("#")]
+
+def main() -> None:
     print_banner()
-    sources = gather_sources(a)
-    if not sources:
-        print("[-] No sources provided. Use --input or --dir.")
-        sys.exit(1)
-    scanner = PelucioScanner(a)
-    scanner.scan(sources)
-    scanner.write_outputs()
+    ap = argparse.ArgumentParser(
+        prog="pelucio",
+        description="Analisa JS e sourcemaps; segue refs de JS; gera CSV/JSON/URLs/wordlist."
+    )
+    ap.add_argument("-i","--input", required=True, help="arquivo com URLs .js (um por linha) ou '-' (stdin)")
+    ap.add_argument("-o","--outdir", default="pelucio_out", help="diretório de saída")
+    ap.add_argument("-t","--threads", type=int, default=10, help="workers em paralelo")
+    ap.add_argument("--timeout", type=float, default=float(DEFAULT_TIMEOUT), help="timeout HTTP (s)")
+    ap.add_argument("--max-depth", type=int, default=3, help="profundidade máxima de cascata (0=apenas os iniciais)")
+    args = ap.parse_args()
+
+    try:
+        inputs = read_input_lines(args.input)
+    except Exception as e:
+        print("[!] failed to read input:", e, file=sys.stderr); sys.exit(2)
+    if not inputs:
+        print("[!] no inputs", file=sys.stderr); sys.exit(2)
+
+    print(f"[+] pelucio: processando {len(inputs)} JS URLs com {args.threads} threads (max-depth={args.max_depth})...\n")
+    summary = run_all(inputs, threads=args.threads, timeout=args.timeout, outdir=args.outdir, max_depth=args.max_depth)
+    print("[+] arquivos gerados:")
+    for k, v in summary.items():
+        print(f"    - {k}: {v}")
 
 if __name__ == "__main__":
     main()
+
