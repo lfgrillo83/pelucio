@@ -31,6 +31,6 @@ Desenvolvido em Python, o Pelucio mantém a lógica do antigo `sourcemap_extract
 ## 📦 Instalação
 
 ```bash
-git clone https://github.com/seuusuario/pelucio.git
+git clone https://github.com/lfgrillo83/pelucio.git
 cd pelucio
 pip install -r requirements.txt
