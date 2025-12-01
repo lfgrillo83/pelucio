@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# pelucio.py v1.4.0
+# pelucio.py v1.4.1
 # Analisa URLs de .js e .map (inline e remotos), detecta possíveis vazamentos,
 # segue referências para outros .js (cascata limitada), e gera:
 #   - pelucio_findings.json
@@ -24,7 +24,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 DEFAULT_TIMEOUT = 15
 UA = f"pelucio/{VERSION}"
 
@@ -52,6 +52,27 @@ FALSE_POS = [
 
 # --- PATTERNS (sem generic_api_key) ---
 PATTERNS = {
+
+    # --- Detectores específicos de tokens internos (novos) ---
+    "system_token_identifier": re.compile(
+        r"\bSYSTEM_TOKEN(?:_BFF)?(?:_[A-Z0-9_]{3,})?\b"
+    ),
+
+    "datadog_synthetics_identifier": re.compile(
+        r"datadog-[a-z0-9\-]+(?:token|public-id|result-id|execution-id)",
+        re.I,
+    ),
+
+    "shopify_checkout_api_token": re.compile(
+        r"shopify-[a-z0-9\-]*token",
+        re.I,
+    ),
+
+    "google_site_verification": re.compile(
+        r"google-site-verification",
+        re.I,
+    ),
+
     "private_key": re.compile(r"-----BEGIN (?:RSA|DSA|EC|PRIVATE) KEY-----"),
     "aws_secret_key": re.compile(r"(?i)aws_secret_access_key.*[:=]\s*[A-Za-z0-9/+=]{40,}"),
     "aws_access_key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -69,8 +90,12 @@ PATTERNS = {
 HIGH_TYPES = {
     "private_key", "aws_secret_key", "aws_access_key", "slack_webhook",
     "jwt", "bearer_token", "query_token", "password_like",
+    "system_token_identifier", "shopify_checkout_api_token",
 }
-LOW_TYPES = {"long_base64", "email", "url"}
+LOW_TYPES = {
+    "long_base64", "email", "url",
+    "datadog_synthetics_identifier", "google_site_verification",
+}
 
 SOURCE_MAP_REGEX = re.compile(r"//#\s*sourceMappingURL\s*=\s*(.+)|//@\s*sourceMappingURL\s*=\s*(.+)")
 INLINE_SOURCEMAP_REGEX = re.compile(r"(?:sourceMappingURL\s*=\s*data:application/json;base64,)([A-Za-z0-9+/=]+)")
@@ -496,4 +521,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
